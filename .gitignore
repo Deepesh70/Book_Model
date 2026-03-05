@@ -20,8 +20,8 @@ src/__pycache__/
 __pycache__/
 *.pyc
 
-# Vector DB
-faiss_store/
+# Vector DB (keep faiss_store/ for deployment — DO NOT ignore)
+# faiss_store/
 vector_store/
 
 # LangGraph
