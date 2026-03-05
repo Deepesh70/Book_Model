@@ -43,11 +43,13 @@ async def lifespan(app: FastAPI):
 # -------------------------
 # FastAPI App
 # -------------------------
+# root_path is needed for HF Spaces reverse proxy to serve /docs correctly
 app = FastAPI(
     title="RAG Question Answering API",
     description="FAISS + SentenceTransformers + Groq LLM",
     version="2.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    root_path=os.getenv("ROOT_PATH", ""),
 )
 
 # CORS for React/Node clients
