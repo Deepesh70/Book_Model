@@ -118,7 +118,22 @@ def load_all_documents(data_dir: str) -> List[Any] :
         
         
     print(f"[DEBUG] Total Loaded Documents : {len(document)}")
-    return document
+    
+    # Filter out documents with None or non-string page_content
+    valid_documents = []
+    invalid_count = 0
+    for doc in document:
+        content = getattr(doc, 'page_content', None)
+        if content is not None and isinstance(content, str):
+            valid_documents.append(doc)
+        else:
+            invalid_count += 1
+    
+    if invalid_count > 0:
+        print(f"[WARNING] Filtered out {invalid_count} documents with invalid page_content (None or non-string)")
+    
+    print(f"[DEBUG] Valid Documents after filtering : {len(valid_documents)}")
+    return valid_documents
 
 
 if __name__ == '__main__':
