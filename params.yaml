@@ -41,3 +41,17 @@ data:
 logging:
   level: "INFO"
   format: "[%(levelname)s] %(asctime)s - %(name)s - %(message)s"
+
+# Theory Synthesis Configuration (for /generate-theory endpoint)
+theory_synthesis:
+  top_k: 8                   # chunks to retrieve for context
+  distance_threshold: 1.0    # L2 distance cutoff — below = relevant, above = fallback
+  default_provider: "gemini" # "gemini" | "groq"  (change here, no code edits needed)
+  gemini_model: "gemini-2.0-flash"
+  groq_model: "llama-3.3-70b-versatile"
+  temperature: 0.4
+
+# Local PDF Ingestion Configuration (for ingest.py)
+# Place your PDFs in: theory_books/<SubjectName>/*.pdf
+ingestion:
+  books_dir: "theory_books"
