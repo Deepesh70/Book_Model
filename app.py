@@ -1,4 +1,5 @@
 import os
+import logging
 from typing import List, Optional
 from contextlib import asynccontextmanager
 
@@ -8,13 +9,18 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from src.search import RAGSearch, RetrievalResult
-from generator import generate_theory_page
+from generator import generate_theory_page, SynthesisResult
 
 import uvicorn
 
 load_dotenv()
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(asctime)s - %(name)s - %(message)s",
+)
+logger = logging.getLogger("ranklen.api")
 
-# Global variable for existing RAG system
+# Global RAG system (for /query endpoint)
 rag_search: Optional[RAGSearch] = None
 
 @asynccontextmanager
@@ -29,18 +35,23 @@ async def lifespan(app: FastAPI):
             embedding_model=embedding_model,
             llm_model=llm_model,
         )
-        print("[INFO] RAG system loaded successfully")
+        logger.info("RAG system loaded successfully")
     except Exception as e:
-        print(f"[WARN] RAG system failed to load: {e}. Server still starts.")
+        logger.warning(f"RAG system failed to load: {e}. Server still starts.")
         rag_search = None
     yield
-    print("[INFO] Shutting down")
+    logger.info("Shutting down")
+
 
 # FastAPI app
 app = FastAPI(
-    title="Ranklen RAG API",
-    description="FAISS + SentenceTransformers + Groq/Gemini  |  /query  /generate-theory",
-    version="3.0.0",
+    title="Ranklen RAG API v4",
+    description=(
+        "Enterprise-grade RAG pipeline with LLM Query Classification + "
+        "Subject-Isolated FAISS Search + Theory Synthesis.\n\n"
+        "Endpoints: /query (legacy) | /generate-theory (classified + filtered)"
+    ),
+    version="4.0.0",
     lifespan=lifespan,
     root_path=os.getenv("ROOT_PATH", ""),
 )
@@ -55,6 +66,7 @@ app.add_middleware(
 )
 
 # ── Request / Response models ─────────────────────────────────────────────────
+
 class SourceItem(BaseModel):
     index: int
     distance: float
@@ -71,18 +83,28 @@ class QueryResponse(BaseModel):
 
 class TheoryRequest(BaseModel):
     topic: str
-    provider: Optional[str] = None  # None -> uses params.yaml default ("gemini")
+    provider: Optional[str] = None
 
 class TheoryResponse(BaseModel):
     success: bool
     topic: str
     content_markdown: str
+    # ── Classification metadata (new in v4) ─────────
+    classified_subject: str                # "DBMS", "Os", "Unknown"
+    search_mode: str                        # "rag_filtered", "fallback_unknown", etc.
     provider_used: str
+    chunks_retrieved: int
+    min_distance: float
+    available_subjects: List[str]
+    classification_time_ms: float
+    synthesis_time_ms: float
 
-# ── Existing routes (unchanged) ───────────────────────────────────────────────
+
+# ── Existing routes ───────────────────────────────────────────────────────────
+
 @app.get("/")
 def root():
-    return {"message": "Ranklen RAG API is running. Go to /docs"}
+    return {"message": "Ranklen RAG API v4 is running. Go to /docs"}
 
 @app.get("/health")
 def health():
@@ -100,14 +122,9 @@ def health():
 @app.post("/query", response_model=QueryResponse)
 def query_rag(payload: QueryRequest):
     if not rag_search:
-        raise HTTPException(
-            status_code=503,
-            detail="RAG system not ready. Run ingest.py first.",
-        )
+        raise HTTPException(status_code=503, detail="RAG system not ready.")
     try:
-        sources: List[RetrievalResult] = rag_search.retrieve(
-            payload.query, top_k=payload.top_k
-        )
+        sources: List[RetrievalResult] = rag_search.retrieve(payload.query, top_k=payload.top_k)
         answer: str = rag_search.summarize(payload.query, sources)
         resp_sources = [
             SourceItem(index=s.index, distance=float(s.distance), text=s.text)
@@ -115,66 +132,60 @@ def query_rag(payload: QueryRequest):
         ]
         return QueryResponse(query=payload.query, answer=answer, sources=resp_sources)
     except Exception as exc:
+        logger.error(f"/query error: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ── NEW: Theory Synthesis endpoint ────────────────────────────────────────────
+# ── Theory Synthesis (Classify → Filter → Synthesize) ─────────────────────────
+
 @app.post("/generate-theory", response_model=TheoryResponse)
 def generate_theory(payload: TheoryRequest):
     """
-    Synthesize an original educational article about the given topic.
+    Enterprise-grade theory synthesis endpoint.
 
-    Flow:
-      1. Queries FAISS for relevant book excerpts (top-k=8 by default).
-      2. Checks L2 distance against threshold (params.yaml: distance_threshold).
-         - Below threshold  -> RAG synthesis (book context provided to LLM).
-         - Above threshold  -> Fallback (LLM uses its general knowledge only).
-      3. FAISS index missing -> graceful fallback (server does NOT crash).
+    Pipeline:
+      1. CLASSIFY — LLM classifies the query into an available subject.
+      2. FILTER   — Subject-isolated FAISS search (only matching chunks).
+      3. GATE     — Deterministic L2 distance threshold check.
+      4. SYNTH    — RAG synthesis (with context) or fallback (general knowledge).
 
-    Request body:
-        { "topic": "Binary Search Trees" }
-        { "topic": "Sorting Algorithms", "provider": "groq" }  // optional override
+    Request:
+        { "topic": "Explain B+ tree indexing" }
+        { "topic": "Process scheduling", "provider": "groq" }
 
-    Response:
-        { "success": true, "topic": "...", "content_markdown": "...", "provider_used": "..." }
+    Response includes full classification metadata for observability.
     """
     if not payload.topic or not payload.topic.strip():
         raise HTTPException(status_code=422, detail="topic must be a non-empty string")
 
     topic    = payload.topic.strip()
-    provider = (payload.provider or "").strip() or None  # None -> params.yaml default
+    provider = (payload.provider or "").strip() or None
 
-    # Resolve which provider will be used (for the response field)
-    import yaml
-    from pathlib import Path as _Path
     try:
-        cfg_provider = (
-            yaml.safe_load(
-                open(_Path(__file__).parent / "params.yaml", encoding="utf-8")
-            )
-            .get("theory_synthesis", {})
-            .get("default_provider", "gemini")
+        result: SynthesisResult = generate_theory_page(
+            topic=topic, provider=provider,
         )
-    except Exception:
-        cfg_provider = "gemini"
-    resolved_provider = provider or cfg_provider
-
-    try:
-        markdown = generate_theory_page(topic=topic, provider=provider)
         return TheoryResponse(
             success=True,
             topic=topic,
-            content_markdown=markdown,
-            provider_used=resolved_provider,
+            content_markdown=result.markdown,
+            classified_subject=result.classified_subject,
+            search_mode=result.search_mode,
+            provider_used=result.provider_used,
+            chunks_retrieved=result.chunks_retrieved,
+            min_distance=result.min_distance,
+            available_subjects=result.available_subjects,
+            classification_time_ms=result.classification_time_ms,
+            synthesis_time_ms=result.synthesis_time_ms,
         )
     except ValueError as ve:
-        # Missing API key
+        logger.error(f"Config/API key error: {ve}")
         raise HTTPException(status_code=503, detail=str(ve))
     except Exception as exc:
+        logger.error(f"Synthesis failed: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Synthesis failed: {str(exc)}")
 
 
-# ── Local run ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(
         "app:app",
